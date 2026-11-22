@@ -25,16 +25,20 @@ class RequestStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
-    FAILED = "failed"
     PARTIAL = "partial"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ParticipantStatus(str, Enum):
+    PENDING = "pending"
     QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class TaskStatus(str, Enum):
@@ -47,6 +51,16 @@ class TaskStatus(str, Enum):
     REJECTED = "rejected"
     FAILED = "failed"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class AttemptStatus(str, Enum):
+    PENDING_DISPATCH = "pending_dispatch"
+    DISPATCHED = "dispatched"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -65,15 +79,39 @@ class Feedback:
 
 
 @dataclass
+class Attempt:
+    """One execution unit. Stable key = request_id/task-id-or-agent/attempt_no.
+
+    Created atomically together with its pending-dispatch record; replaying the
+    same key returns the same attempt and never creates a second run.
+    """
+
+    downstream_key: str
+    request_id: str
+    agent_id: str
+    attempt_no: int
+    task_id: Optional[str] = None
+    run_id: Optional[str] = None
+    status: str = AttemptStatus.PENDING_DISPATCH.value
+    created_at: str = field(default_factory=utcnow)
+    updated_at: str = field(default_factory=utcnow)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Attempt":
+        return cls(**d)
+
+
+@dataclass
 class Participant:
     agent_id: str
-    status: str = ParticipantStatus.QUEUED.value
+    status: str = ParticipantStatus.PENDING.value
     run_id: Optional[str] = None
     downstream_key: str = ""
     content: Optional[str] = None
     latency_ms: Optional[int] = None
     error: Optional[str] = None
     injected_context: Optional[str] = None
+    trigger_outcome: str = "triggered"
 
 
 @dataclass
@@ -92,6 +130,9 @@ class Task:
     downstream_key: str = ""
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
+    version: int = 1
+    review_decision: Optional[Dict[str, Any]] = None
+    run_ids: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Task":
@@ -99,9 +140,14 @@ class Task:
         d["feedback"] = Feedback.from_dict(d.get("feedback"))
         return cls(**d)
 
+    @property
+    def remaining_attempts(self) -> int:
+        return max(0, self.max_attempts - self.attempt_count)
+
 
 @dataclass
 class AuditEvent:
+    seq: int
     timestamp: str
     actor: str
     action: str
@@ -126,11 +172,16 @@ class MultiTriggerRequest:
     seen_agents: List[str] = field(default_factory=list)
     allow_loop_override: bool = False
     status: str = RequestStatus.PENDING.value
+    version: int = 1
+    body_hash: str = ""
     participants: List[Participant] = field(default_factory=list)
     tasks: List[Task] = field(default_factory=list)
+    attempts: List[Attempt] = field(default_factory=list)
     audit: List[AuditEvent] = field(default_factory=list)
+    late_replies: List[Dict[str, Any]] = field(default_factory=list)
     final_answer: Optional[Dict[str, Any]] = None
     invocation_graph: List[Dict[str, Any]] = field(default_factory=list)
+    degradation: Optional[Dict[str, Any]] = None
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
 
@@ -142,6 +193,7 @@ class MultiTriggerRequest:
         d = dict(d)
         d["participants"] = [Participant(**p) for p in d.get("participants", [])]
         d["tasks"] = [Task.from_dict(t) for t in d.get("tasks", [])]
+        d["attempts"] = [Attempt.from_dict(a) for a in d.get("attempts", [])]
         d["audit"] = [AuditEvent(**a) for a in d.get("audit", [])]
         return cls(**d)
 
@@ -151,3 +203,6 @@ class MultiTriggerRequest:
 
     def task(self, task_id: str) -> Optional[Task]:
         return next((t for t in self.tasks if t.task_id == task_id), None)
+
+    def attempt(self, downstream_key: str) -> Optional[Attempt]:
+        return next((a for a in self.attempts if a.downstream_key == downstream_key), None)

@@ -1,37 +1,51 @@
 from .errors import InvalidTransition
 from .models import RequestStatus, TaskStatus
 
-# Request: pending -> queued -> running -> completed | failed | partial
-# ``partial -> completed`` is a controlled recovery transition for late replies.
+# Request: pending -> queued -> running -> completed | partial | failed | cancelled
+# Terminal states have no outgoing transitions. Late replies NEVER reopen them.
 REQUEST_TRANSITIONS = {
-    RequestStatus.PENDING.value: {RequestStatus.QUEUED.value},
+    RequestStatus.PENDING.value: {
+        RequestStatus.QUEUED.value,
+        RequestStatus.CANCELLED.value,
+    },
     RequestStatus.QUEUED.value: {
         RequestStatus.RUNNING.value,
         RequestStatus.FAILED.value,
+        RequestStatus.CANCELLED.value,
     },
     RequestStatus.RUNNING.value: {
         RequestStatus.COMPLETED.value,
         RequestStatus.FAILED.value,
         RequestStatus.PARTIAL.value,
+        RequestStatus.CANCELLED.value,
     },
-    RequestStatus.PARTIAL.value: {RequestStatus.COMPLETED.value},
     RequestStatus.COMPLETED.value: set(),
+    RequestStatus.PARTIAL.value: set(),
     RequestStatus.FAILED.value: set(),
+    RequestStatus.CANCELLED.value: set(),
 }
 
-# Supervisor task state machine. ``rejected -> assigned`` is only allowed when
-# attempt_count < max_attempts; that guard lives in the service layer.
+# Supervisor task. ``rejected -> assigned`` only while attempt_count < max_attempts
+# (guard lives in the service). Cancellation is allowed before a final decision.
 TASK_TRANSITIONS = {
-    TaskStatus.PENDING.value: {TaskStatus.ASSIGNED.value},
+    TaskStatus.PENDING.value: {
+        TaskStatus.ASSIGNED.value,
+        TaskStatus.CANCELLED.value,
+    },
     TaskStatus.ASSIGNED.value: {
         TaskStatus.IN_PROGRESS.value,
         TaskStatus.FAILED.value,
+        TaskStatus.CANCELLED.value,
     },
     TaskStatus.IN_PROGRESS.value: {
         TaskStatus.SUBMITTED.value,
         TaskStatus.FAILED.value,
+        TaskStatus.CANCELLED.value,
     },
-    TaskStatus.SUBMITTED.value: {TaskStatus.REVIEWED.value},
+    TaskStatus.SUBMITTED.value: {
+        TaskStatus.REVIEWED.value,
+        TaskStatus.CANCELLED.value,
+    },
     TaskStatus.REVIEWED.value: {
         TaskStatus.APPROVED.value,
         TaskStatus.REJECTED.value,
@@ -43,6 +57,7 @@ TASK_TRANSITIONS = {
     },
     TaskStatus.COMPLETED.value: set(),
     TaskStatus.FAILED.value: set(),
+    TaskStatus.CANCELLED.value: set(),
 }
 
 
@@ -61,6 +76,7 @@ def assert_task_transition(current: str, new: str) -> None:
 def is_terminal_request(status: str) -> bool:
     return status in (
         RequestStatus.COMPLETED.value,
-        RequestStatus.FAILED.value,
         RequestStatus.PARTIAL.value,
+        RequestStatus.FAILED.value,
+        RequestStatus.CANCELLED.value,
     )

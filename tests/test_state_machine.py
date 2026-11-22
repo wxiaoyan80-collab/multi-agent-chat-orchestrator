@@ -19,18 +19,31 @@ def test_request_happy_path_transitions():
 
 
 @pytest.mark.parametrize(
-    "status", [RequestStatus.COMPLETED, RequestStatus.FAILED]
+    "status",
+    [
+        RequestStatus.COMPLETED,
+        RequestStatus.PARTIAL,
+        RequestStatus.FAILED,
+        RequestStatus.CANCELLED,
+    ],
 )
 def test_terminal_request_has_no_outgoing_transition(status):
     assert is_terminal_request(status.value)
-    with pytest.raises(InvalidTransition):
-        assert_request_transition(status.value, RequestStatus.RUNNING.value)
+    for target in (RequestStatus.RUNNING, RequestStatus.COMPLETED):
+        with pytest.raises(InvalidTransition):
+            assert_request_transition(status.value, target.value)
 
 
-def test_partial_can_recover_to_completed_on_late_reply():
-    assert_request_transition(RequestStatus.PARTIAL.value, RequestStatus.COMPLETED.value)
+def test_partial_is_terminal_even_on_late_reply():
     with pytest.raises(InvalidTransition):
-        assert_request_transition(RequestStatus.PARTIAL.value, RequestStatus.RUNNING.value)
+        assert_request_transition(RequestStatus.PARTIAL.value, RequestStatus.COMPLETED.value)
+    with pytest.raises(InvalidTransition):
+        assert_request_transition(RequestStatus.PARTIAL.value, RequestStatus.CANCELLED.value)
+
+
+def test_cancel_allowed_from_non_terminal_states():
+    for source in (RequestStatus.PENDING, RequestStatus.QUEUED, RequestStatus.RUNNING):
+        assert_request_transition(source.value, RequestStatus.CANCELLED.value)
 
 
 def test_task_full_approval_flow():
@@ -51,8 +64,9 @@ def test_task_reject_can_retry_or_fail():
     assert_task_transition(TaskStatus.REJECTED.value, TaskStatus.FAILED.value)
 
 
-def test_task_illegal_skips_rejected():
+def test_task_illegal_skips_and_cancellation():
     with pytest.raises(InvalidTransition):
         assert_task_transition(TaskStatus.PENDING.value, TaskStatus.SUBMITTED.value)
     with pytest.raises(InvalidTransition):
         assert_task_transition(TaskStatus.COMPLETED.value, TaskStatus.ASSIGNED.value)
+    assert_task_transition(TaskStatus.SUBMITTED.value, TaskStatus.CANCELLED.value)

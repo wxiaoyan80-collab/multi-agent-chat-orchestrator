@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Optional, Set
 
 from .config import ServiceConfig
-from .errors import AuthorizationError, BudgetExceeded, LoopDetected
+from .errors import AuthorizationError, BudgetExceeded, LoopDetected, Unauthenticated
 
 
 @dataclass
@@ -51,7 +51,7 @@ class StaticAuthorizationProvider(AuthorizationProvider):
     def resolve_session(self, token: str) -> Session:
         session = self.sessions.get(token)
         if session is None:
-            raise AuthorizationError("invalid or expired session")
+            raise Unauthenticated("invalid or expired session")
         return session
 
     def can_invoke(self, session: Session, agent_id: str) -> bool:

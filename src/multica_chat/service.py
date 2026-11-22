@@ -1,9 +1,12 @@
-"""Multi-trigger platform service.
+"""Multi-trigger platform service (MARS-20), aligned with the MARS-22 API spec
+and the MARS-20/22 offline contract draft.
 
-Owns the request/task state machines, the three execution strategies, dispatch
-idempotency, permission re-checks, budgets, audit and aggregation.
+Owns request/task state machines, three execution strategies, attempt records,
+dispatch idempotency, permission re-checks, budgets, audit and aggregation.
 """
 
+import hashlib
+import json
 import re
 import threading
 from dataclasses import dataclass, field
@@ -12,8 +15,20 @@ from uuid import uuid4
 
 from .config import ServiceConfig
 from .dispatcher import RUN_COMPLETED, RUN_FAILED, RUN_TIMEOUT, Dispatcher, RunResult
-from .errors import AuthorizationError, NotFound, ValidationError
+from .errors import (
+    AuthorizationError,
+    Conflict,
+    InvalidReviewTransition,
+    InvalidTransition,
+    NotFound,
+    PreconditionFailed,
+    ReviewFeedbackRequired,
+    TaskNotFound,
+    ValidationError,
+)
 from .models import (
+    Attempt,
+    AttemptStatus,
     AuditEvent,
     Feedback,
     MergeStrategy,
@@ -34,7 +49,7 @@ from .security import (
     sanitize_for_agent,
     summarize,
 )
-from .state_machine import assert_request_transition, assert_task_transition
+from .state_machine import assert_request_transition, assert_task_transition, is_terminal_request
 
 _DISAGREEMENT = re.compile(r"不同意|disagree|however|但是|相反|conflict|contradict", re.IGNORECASE)
 
@@ -69,24 +84,8 @@ class MultiTriggerService:
         self._lock = threading.RLock()
 
     # ---- helpers -------------------------------------------------------------
-    def _audit(
-        self, request: MultiTriggerRequest, action: str, actor: str, **detail: Any
-    ) -> None:
-        request.audit.append(AuditEvent(utcnow(), actor, action, detail))
-
-    def _transition(
-        self, request: MultiTriggerRequest, new_status: str, actor: str = "system", **detail: Any
-    ) -> None:
-        assert_request_transition(request.status, new_status)
-        request.status = new_status
-        request.updated_at = utcnow()
-        self._audit(request, "request_status", actor, to=new_status, **detail)
-
-    def _downstream_key(self, request: MultiTriggerRequest, agent_id: str, attempt: int) -> str:
-        # Deterministic: stable across restarts and client resends.
-        return f"mt:{request.request_id}:{agent_id}:{attempt}"
-
-    def _planned_participants(self, ids: List[str]) -> List[str]:
+    @staticmethod
+    def _canonical_ids(ids: List[str]) -> List[str]:
         seen, result = set(), []
         for agent_id in ids:
             if agent_id not in seen:
@@ -94,26 +93,96 @@ class MultiTriggerService:
                 result.append(agent_id)
         return result
 
+    @classmethod
+    def _body_hash(cls, inp: TriggerInput) -> str:
+        normalized = {
+            "user_prompt": inp.user_prompt,
+            "participant_agent_ids": cls._canonical_ids(inp.participant_agent_ids),
+            "mode": inp.mode,
+            "supervisor_agent_id": inp.supervisor_agent_id,
+            "timeout_seconds": inp.timeout_seconds,
+            "merge_strategy": inp.merge_strategy,
+            "max_attempts": inp.max_attempts,
+        }
+        raw = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _audit(
+        self, request: MultiTriggerRequest, action: str, actor: str, **detail: Any
+    ) -> None:
+        request.audit.append(
+            AuditEvent(len(request.audit) + 1, utcnow(), actor, action, detail)
+        )
+
+    def _transition(
+        self, request: MultiTriggerRequest, new_status: str, actor: str = "system", **detail: Any
+    ) -> None:
+        assert_request_transition(request.status, new_status)
+        request.status = new_status
+        request.version += 1
+        request.updated_at = utcnow()
+        self._audit(request, "state_transition", actor, to=new_status, **detail)
+
+    def _attempt(
+        self,
+        request: MultiTriggerRequest,
+        agent_id: str,
+        attempt_no: int,
+        task_id: Optional[str] = None,
+    ) -> Attempt:
+        """Get-or-create an attempt. Same key => same record, even on replay."""
+        suffix = task_id or agent_id
+        key = f"mt:{request.request_id}:{suffix}:{attempt_no}"
+        candidate = Attempt(
+            downstream_key=key,
+            request_id=request.request_id,
+            agent_id=agent_id,
+            attempt_no=attempt_no,
+            task_id=task_id,
+        )
+        stored = self.store.get_or_create_attempt(candidate)
+        if request.attempt(stored.downstream_key) is None:
+            request.attempts.append(stored)
+        return stored
+
+    def _enqueue_attempt(
+        self,
+        attempt: Attempt,
+        payload: Dict[str, Any],
+        context: Optional[str] = None,
+    ) -> str:
+        # Replay with a lost ack reuses the same downstream key; the dispatcher
+        # deduplicates, so no second run is created.
+        if attempt.run_id is None:
+            attempt.run_id = self.dispatcher.enqueue(
+                attempt.agent_id, attempt.downstream_key, payload, context
+            )
+            attempt.status = AttemptStatus.DISPATCHED.value
+            attempt.updated_at = utcnow()
+            self.store.update_attempt(attempt)
+        return attempt.run_id
+
     def _authorized(self, session: Any, agent_ids: List[str]) -> List[str]:
-        # Re-check at actual dispatch; no reliance on a prior preview.
         return [a for a in agent_ids if self.authz.can_invoke(session, a)]
 
-    # ---- preview (advisory only) --------------------------------------------
+    # ---- preview ------------------------------------------------------------
     def preview(self, token: str, inp: TriggerInput) -> Dict[str, Any]:
         with self._lock:
             session = self.authz.resolve_session(token)
             if not session.is_human:
                 raise AuthorizationError("only a human session can originate a group chat")
-            ids = self._planned_participants(inp.participant_agent_ids)
+            ids = self._canonical_ids(inp.participant_agent_ids)
             enforce_participant_budget(ids, self.config)
             planned, denied = [], []
             for agent_id in ids:
                 if self.authz.can_invoke(session, agent_id):
-                    planned.append({"agent_id": agent_id, "invocable": True})
+                    planned.append({"agent_id": agent_id, "status": "triggerable"})
                 else:
-                    # Do not reveal existence or online status of invisible agents.
-                    denied.append({"agent_id": agent_id, "invocable": False, "note": "unavailable"})
-            return {"advisory": True, "planned": planned, "denied": denied}
+                    # Do not reveal existence / online status of invisible agents.
+                    denied.append(
+                        {"agent_id": agent_id, "status": "denied", "reason": "unavailable"}
+                    )
+            return {"participants": planned + denied, "advisory": True}
 
     # ---- trigger ------------------------------------------------------------
     def trigger(self, token: str, inp: TriggerInput) -> MultiTriggerRequest:
@@ -122,13 +191,23 @@ class MultiTriggerService:
             if not session.is_human:
                 raise AuthorizationError("only a human session can originate a group chat")
 
-            existing = self.store.get_by_idempotency_key(inp.idempotency_key)
-            if existing is not None:
-                self._audit(existing, "idempotent_replay", session.initiator_id)
-                self.store.save(existing)
-                return existing
+            body_hash = self._body_hash(inp)
+            known = self.store.get_idempotency(
+                session.workspace_id, session.initiator_id, inp.idempotency_key
+            )
+            if known:
+                request_id, known_hash = known
+                if known_hash != body_hash:
+                    raise Conflict(
+                        "idempotency key reused with a different body",
+                        idempotency_key=inp.idempotency_key,
+                    )
+                request = self.store.get_by_id(request_id)
+                self._audit(request, "idempotent_replay", session.initiator_id)
+                self.store.save(request)
+                return request
 
-            ids = self._planned_participants(inp.participant_agent_ids)
+            ids = self._canonical_ids(inp.participant_agent_ids)
             enforce_participant_budget(ids, self.config)
             override = bool(inp.allow_loop_override and session.is_human)
             enforce_invocation_limits(
@@ -141,6 +220,8 @@ class MultiTriggerService:
             )
             if inp.mode == Mode.SUPERVISOR.value and not inp.supervisor_agent_id:
                 raise ValidationError("supervisor_agent_id is required in supervisor mode")
+            if inp.mode == Mode.SUPERVISOR.value and inp.supervisor_agent_id in ids:
+                raise ValidationError("supervisor_agent_id must not be a participant")
 
             request = MultiTriggerRequest(
                 request_id=f"req-{uuid4().hex[:16]}",
@@ -158,10 +239,18 @@ class MultiTriggerService:
                 upstream_depth=inp.upstream_depth,
                 seen_agents=list(inp.seen_agents),
                 allow_loop_override=override,
+                body_hash=body_hash,
             )
             self._audit(request, "request_created", session.initiator_id, participants=ids)
             self._transition(request, RequestStatus.QUEUED.value, session.initiator_id)
-            self.store.save(request)
+
+            existing = self.store.create_request_atomic(request, body_hash)
+            if existing is not None:
+                if existing.body_hash != body_hash:
+                    raise Conflict("idempotency key reused with a different body")
+                self._audit(existing, "idempotent_replay", session.initiator_id)
+                self.store.save(existing)
+                return existing
 
             if request.mode == Mode.PARALLEL.value:
                 self._run_parallel(request, session, ids)
@@ -171,7 +260,6 @@ class MultiTriggerService:
                 self._run_supervisor(request, session, ids)
             else:
                 raise ValidationError(f"unknown mode: {request.mode}")
-
             self.store.save(request)
             return request
 
@@ -186,6 +274,7 @@ class MultiTriggerService:
     ) -> bool:
         if not self.authz.can_invoke(session, participant.agent_id):
             participant.status = ParticipantStatus.FAILED.value
+            participant.trigger_outcome = "denied"
             participant.error = "not_authorized"
             self._audit(
                 request,
@@ -195,29 +284,27 @@ class MultiTriggerService:
                 reason="invoke gate denied at dispatch",
             )
             return False
+
+        attempt = self._attempt(request, participant.agent_id, 1)
         payload = sanitize_for_agent(
             {"user_prompt": request.user_prompt, "context": context or ""}
         )
-        participant.downstream_key = self._downstream_key(
-            request, participant.agent_id, 1
-        )
-        participant.run_id = self.dispatcher.enqueue(
-            participant.agent_id,
-            participant.downstream_key,
-            payload,
-            context,
-        )
+        run_id = self._enqueue_attempt(attempt, payload, context)
+        participant.run_id = run_id
+        participant.downstream_key = attempt.downstream_key
         participant.status = ParticipantStatus.RUNNING.value
         participant.injected_context = context
         request.invocation_graph.append(
-            {"from": session.initiator_id, "to": participant.agent_id, "run_id": participant.run_id}
+            {"from": session.initiator_id, "to": participant.agent_id, "run_id": run_id}
         )
         self._audit(
             request,
             "dispatched",
             actor,
             agent_id=participant.agent_id,
-            run_id=participant.run_id,
+            run_id=run_id,
+            downstream_key=attempt.downstream_key,
+            attempt_no=attempt.attempt_no,
         )
         self.store.save(request)
         return True
@@ -227,15 +314,25 @@ class MultiTriggerService:
             participant.run_id, request.timeout_seconds
         )
         participant.latency_ms = result.latency_ms
+        attempt = request.attempt(participant.downstream_key)
         if result.status == RUN_COMPLETED:
             participant.status = ParticipantStatus.COMPLETED.value
             participant.content = result.content
+            if attempt:
+                attempt.status = AttemptStatus.COMPLETED.value
         elif result.status == RUN_TIMEOUT:
             participant.status = ParticipantStatus.TIMEOUT.value
             participant.error = result.error or "timeout"
+            if attempt:
+                attempt.status = AttemptStatus.TIMEOUT.value
         else:
             participant.status = ParticipantStatus.FAILED.value
             participant.error = result.error or "run failed"
+            if attempt:
+                attempt.status = AttemptStatus.FAILED.value
+        if attempt:
+            attempt.updated_at = utcnow()
+            self.store.update_attempt(attempt)
         self._audit(
             request,
             "result_collected",
@@ -245,6 +342,22 @@ class MultiTriggerService:
             result_status=result.status,
         )
         self.store.save(request)
+
+    def _degradation_hint(self, request: MultiTriggerRequest, planned: int) -> None:
+        failed = sum(
+            1
+            for p in request.participants
+            if p.status
+            in (ParticipantStatus.FAILED.value, ParticipantStatus.TIMEOUT.value)
+        )
+        if planned and failed * 2 > planned:  # majority failed; denominator = planned units
+            request.degradation = {
+                "reason": "majority_failed",
+                "failed_units": failed,
+                "planned_units": planned,
+                "suggestion": "human_takeover_or_single_expert",
+            }
+            self._audit(request, "degradation_suggested", "system", failed=failed, planned=planned)
 
     def _finish_from_participants(
         self, request: MultiTriggerRequest, session: Any, actor: str
@@ -260,8 +373,10 @@ class MultiTriggerService:
             self._transition(request, RequestStatus.COMPLETED.value, actor)
         else:
             self._transition(request, RequestStatus.PARTIAL.value, actor)
+        # Denominator is planned execution units, not attempts.
+        self._degradation_hint(request, len(request.participant_ids))
         request.final_answer = self._aggregate(request, session)
-        self._audit(request, "aggregated", actor, strategy=request.merge_strategy)
+        self._audit(request, "merged", actor, strategy=request.merge_strategy)
 
     def _run_parallel(
         self, request: MultiTriggerRequest, session: Any, ids: List[str]
@@ -283,25 +398,22 @@ class MultiTriggerService:
     ) -> None:
         actor = session.initiator_id
         context: Optional[str] = None
-        previous_ok = True
         for agent_id in ids:
             participant = Participant(agent_id=agent_id)
             request.participants.append(participant)
-            if not previous_ok:
-                # Strong dependency: no usable predecessor context -> skip dispatch.
-                participant.status = ParticipantStatus.FAILED.value
-                participant.error = "dependency_failed"
-                self._audit(request, "dependency_failed", actor, agent_id=agent_id)
-                self.store.save(request)
+            if context is None and request.participants.index(participant) > 0:
+                # Strong dependency: predecessor failed -> mark skipped, no dispatch.
+                participant.status = ParticipantStatus.SKIPPED.value
+                self._audit(request, "participant_skipped", actor, agent_id=agent_id)
                 continue
             if not self._dispatch_participant(request, session, participant, context, actor):
-                previous_ok = False
+                context = None
                 continue
             self._collect(request, participant, actor)
             if participant.status == ParticipantStatus.COMPLETED.value and participant.content:
                 context = participant.content
             else:
-                previous_ok = False
+                context = None
         self._finish_from_participants(request, session, actor)
 
     def _run_supervisor(
@@ -310,9 +422,7 @@ class MultiTriggerService:
         actor = session.initiator_id
         supervisor = request.supervisor_agent_id
         if not supervisor or not self.authz.can_invoke(session, supervisor):
-            self._transition(
-                request, RequestStatus.RUNNING.value, actor
-            )
+            self._transition(request, RequestStatus.RUNNING.value, actor)
             self._transition(
                 request,
                 RequestStatus.FAILED.value,
@@ -321,11 +431,11 @@ class MultiTriggerService:
             )
             return
 
+        sup_attempt = self._attempt(request, supervisor, 1)
         sup_payload = sanitize_for_agent(
             {"user_prompt": request.user_prompt, "context": "supervisor planning"}
         )
-        sup_key = self._downstream_key(request, supervisor, 0)
-        sup_run = self.dispatcher.enqueue(supervisor, sup_key, sup_payload, None)
+        sup_run = self._enqueue_attempt(sup_attempt, sup_payload)
         request.invocation_graph.append(
             {"from": actor, "to": supervisor, "run_id": sup_run, "role": "supervisor"}
         )
@@ -359,7 +469,7 @@ class MultiTriggerService:
     def _assign_task(self, request: MultiTriggerRequest, task: Task, actor: str) -> None:
         assert_task_transition(task.status, TaskStatus.ASSIGNED.value)
         task.status = TaskStatus.ASSIGNED.value
-        task.attempt_count += 1  # attempts are 1-based
+        task.attempt_count += 1  # 1-based; increment happens only when a new attempt is created
         task.updated_at = utcnow()
         self._audit(
             request,
@@ -394,17 +504,17 @@ class MultiTriggerService:
                 },
             }
         )
-        task.downstream_key = self._downstream_key(
-            request, task.worker_agent_id, task.attempt_count
-        )
-        task.run_id = self.dispatcher.enqueue(
-            task.worker_agent_id, task.downstream_key, payload, None
-        )
+        # The attempt key is request/task/attempt_no -> one execution per attempt.
+        attempt = self._attempt(request, task.worker_agent_id, task.attempt_count, task.task_id)
+        run_id = self._enqueue_attempt(attempt, payload)
+        task.run_id = run_id
+        if run_id not in task.run_ids:
+            task.run_ids.append(run_id)
         request.invocation_graph.append(
             {
                 "from": task.supervisor_agent_id,
                 "to": task.worker_agent_id,
-                "run_id": task.run_id,
+                "run_id": run_id,
                 "task_id": task.task_id,
                 "attempt": task.attempt_count,
             }
@@ -414,14 +524,21 @@ class MultiTriggerService:
             "task_dispatched",
             actor,
             task_id=task.task_id,
-            run_id=task.run_id,
+            run_id=run_id,
+            downstream_key=attempt.downstream_key,
             attempt_count=task.attempt_count,
         )
-        result = self.dispatcher.await_result(task.run_id, request.timeout_seconds)
+        result = self.dispatcher.await_result(run_id, request.timeout_seconds)
         if result.status != RUN_COMPLETED:
             assert_task_transition(task.status, TaskStatus.FAILED.value)
             task.status = TaskStatus.FAILED.value
             task.result = None
+            attempt.status = (
+                AttemptStatus.TIMEOUT.value
+                if result.status == RUN_TIMEOUT
+                else AttemptStatus.FAILED.value
+            )
+            self.store.update_attempt(attempt)
             self._audit(
                 request,
                 "task_failed",
@@ -436,6 +553,8 @@ class MultiTriggerService:
         task.status = TaskStatus.SUBMITTED.value
         task.result = result.content
         task.updated_at = utcnow()
+        attempt.status = AttemptStatus.COMPLETED.value
+        self.store.update_attempt(attempt)
         self._audit(request, "task_submitted", actor, task_id=task.task_id)
 
     def review_task(
@@ -445,31 +564,67 @@ class MultiTriggerService:
         token: str,
         action: str,
         feedback: Optional[Dict[str, Any]] = None,
+        expected_version: Optional[int] = None,
+        decision_id: Optional[str] = None,
     ) -> MultiTriggerRequest:
-        with self._lock:
-            session = self.authz.resolve_session(token)
-            request = self.store.get_by_id(request_id)
-            if request is None:
-                raise NotFound(f"request {request_id} not found")
+        session = self.authz.resolve_session(token)
+
+        def mutate(request: MultiTriggerRequest) -> None:
+            task = request.task(task_id)
+            if task is None:
+                raise TaskNotFound(f"task {task_id} not found")
             if session.initiator_id not in (
                 request.initiator_id,
                 request.supervisor_agent_id,
             ):
                 raise AuthorizationError("caller may not review this task")
-            task = request.task(task_id)
-            if task is None:
-                raise NotFound(f"task {task_id} not found")
-            if task.status != TaskStatus.SUBMITTED.value:
-                raise ValidationError(
-                    f"task is {task.status}, only a submitted task can be reviewed"
+
+            # Idempotent replay applies only to a decision on the SAME attempt.
+            # A new attempt (after a reject) accepts a fresh decision even when
+            # the feedback text is identical.
+            if task.review_decision and task.review_decision.get("attempt_no") == task.attempt_count:
+                decision = task.review_decision
+                same = (
+                    decision.get("action") == action
+                    and decision.get("feedback") == (feedback or {})
                 )
+                if expected_version is not None and expected_version != decision.get(
+                    "expected_version"
+                ):
+                    raise PreconditionFailed(
+                        "task version changed",
+                        expected=expected_version,
+                        actual=task.version,
+                    )
+                if same:
+                    self._audit(
+                        request, "review_replay", session.initiator_id, task_id=task_id
+                    )
+                    return
+                if task.status != TaskStatus.SUBMITTED.value:
+                    raise InvalidReviewTransition(
+                        f"task is {task.status}; no further decision is accepted"
+                    )
+                raise Conflict("a different decision was already recorded", task_id=task_id)
+
+            if expected_version is not None and task.version != expected_version:
+                raise PreconditionFailed(
+                    "task version changed", expected=expected_version, actual=task.version
+                )
+            if task.status != TaskStatus.SUBMITTED.value:
+                raise InvalidReviewTransition(
+                    f"task is {task.status}; only a submitted task can be reviewed"
+                )
+            decision_attempt = task.attempt_count
             if action not in ("approve", "reject"):
                 raise ValidationError("action must be approve or reject")
             parsed: Optional[Feedback] = None
             if action == "reject":
                 parsed = Feedback.from_dict(feedback)
-                if not parsed.reject_reason:
-                    raise ValidationError("reject requires feedback.reject_reason")
+                if not parsed.reject_reason or not parsed.change_instructions:
+                    raise ReviewFeedbackRequired(
+                        "reject requires reject_reason and change_instructions"
+                    )
 
             assert_task_transition(task.status, TaskStatus.REVIEWED.value)
             task.status = TaskStatus.REVIEWED.value
@@ -482,6 +637,7 @@ class MultiTriggerService:
                 review_action=action,
             )
 
+            new_run_id: Optional[str] = None
             if action == "approve":
                 assert_task_transition(task.status, TaskStatus.APPROVED.value)
                 task.status = TaskStatus.APPROVED.value
@@ -500,6 +656,7 @@ class MultiTriggerService:
                     task_id=task_id,
                     feedback=parsed.__dict__,
                 )
+                # attempt_count reaches max_attempts on the third rejection -> fail.
                 if task.attempt_count >= task.max_attempts:
                     assert_task_transition(task.status, TaskStatus.FAILED.value)
                     task.status = TaskStatus.FAILED.value
@@ -511,16 +668,50 @@ class MultiTriggerService:
                         attempt_count=task.attempt_count,
                     )
                 else:
-                    # _assign_task increments attempt_count for the new attempt.
                     self._assign_task(request, task, session.initiator_id)
                     self._start_and_submit_task(request, task, session.initiator_id, parsed)
-                    # retry keeps the worker run id current; no duplicate submission
+                    new_run_id = task.run_ids[-1] if task.run_ids else None
+                    self._audit(request, "task_redispatched", session.initiator_id, task_id=task_id)
                     self._audit(request, "task_retry", session.initiator_id, task_id=task_id)
 
+            task.version += 1
+            task.review_decision = {
+                "action": action,
+                "feedback": feedback or {},
+                "attempt_no": decision_attempt,
+                "expected_version": expected_version,
+                "version": task.version,
+                "decision_id": decision_id or f"dec-{task_id}-{task.version}",
+                "new_run_id": new_run_id,
+            }
             task.updated_at = utcnow()
             self._maybe_finalize_supervisor(request, session)
-            self.store.save(request)
-            return request
+
+        self.store.update_atomic(request_id, mutate)
+        return self.store.get_by_id(request_id)
+
+    def review_response(
+        self, request_id: str, task_id: str, token: str
+    ) -> Dict[str, Any]:
+        self.authz.resolve_session(token)
+        request = self.store.get_by_id(request_id)
+        if request is None:
+            raise NotFound(f"request {request_id} not found")
+        task = request.task(task_id)
+        if task is None:
+            raise TaskNotFound(f"task {task_id} not found")
+        decision = task.review_decision or {}
+        return {
+            "task_id": task.task_id,
+            "status": task.status,
+            "attempt_count": task.attempt_count,
+            "max_attempts": task.max_attempts,
+            "remaining_attempts": task.remaining_attempts,
+            "feedback": task.feedback.__dict__ if task.feedback else None,
+            "new_run_id": decision.get("new_run_id"),
+            "version": task.version,
+            "request_status": request.status,
+        }
 
     def _maybe_finalize_supervisor(
         self, request: MultiTriggerRequest, session: Any
@@ -530,68 +721,136 @@ class MultiTriggerService:
         statuses = [t.status for t in request.tasks]
         if all(s == TaskStatus.COMPLETED.value for s in statuses):
             self._transition(request, RequestStatus.COMPLETED.value, session.initiator_id)
-        elif all(s in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value) for s in statuses):
+        elif all(
+            s in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value) for s in statuses
+        ):
             self._transition(request, RequestStatus.PARTIAL.value, session.initiator_id)
         else:
             return
         request.final_answer = self._aggregate(request, session)
-        self._audit(request, "aggregated", session.initiator_id, strategy=request.merge_strategy)
+        self._audit(request, "merged", session.initiator_id, strategy=request.merge_strategy)
 
-    # ---- late replies & reads ------------------------------------------------
+    # ---- cancellation / late replies / reads ---------------------------------
+    def cancel_request(self, request_id: str, token: str) -> MultiTriggerRequest:
+        session = self.authz.resolve_session(token)
+
+        def mutate(request: MultiTriggerRequest) -> None:
+            if session.initiator_id != request.initiator_id:
+                raise AuthorizationError("caller may not cancel this request")
+            if is_terminal_request(request.status):
+                raise InvalidTransition("request is already final")
+            self._transition(request, RequestStatus.CANCELLED.value, session.initiator_id)
+            for participant in request.participants:
+                if not is_terminal_request(
+                    participant.status
+                ) and participant.status != ParticipantStatus.COMPLETED.value:
+                    participant.status = ParticipantStatus.CANCELLED.value
+            for task in request.tasks:
+                if task.status not in (
+                    TaskStatus.COMPLETED.value,
+                    TaskStatus.FAILED.value,
+                ):
+                    task.status = TaskStatus.CANCELLED.value
+            # No further dispatch: mark pending attempts cancelled.
+            for attempt in request.attempts:
+                if attempt.status == AttemptStatus.PENDING_DISPATCH.value:
+                    attempt.status = AttemptStatus.CANCELLED.value
+            self._audit(request, "cancelled", session.initiator_id)
+
+        self.store.update_atomic(request_id, mutate)
+        return self.store.get_by_id(request_id)
+
     def ingest_late_reply(
         self, request_id: str, agent_id: str, content: str, token: str
     ) -> MultiTriggerRequest:
-        with self._lock:
-            session = self.authz.resolve_session(token)
-            request = self.store.get_by_id(request_id)
-            if request is None:
-                raise NotFound(f"request {request_id} not found")
+        session = self.authz.resolve_session(token)
+
+        def mutate(request: MultiTriggerRequest) -> None:
             if session.initiator_id != request.initiator_id:
                 raise AuthorizationError("caller may not ingest replies for this request")
-            participant = request.participant(agent_id)
-            if participant is None:
-                participant = Participant(agent_id=agent_id)
-                request.participants.append(participant)
-            if participant.status in (
-                ParticipantStatus.COMPLETED.value,
-                ParticipantStatus.RUNNING.value,
-            ):
-                return request
-            participant.content = content
-            participant.status = ParticipantStatus.COMPLETED.value
-            participant.latency_ms = participant.latency_ms
+            entry = {
+                "seq": len(request.late_replies) + 1,
+                "agent_id": agent_id,
+                "content": content,
+                "received_at": utcnow(),
+                "request_was_final": is_terminal_request(request.status),
+                "included_in_summary": False,
+            }
+            request.late_replies.append(entry)
+            request.version += 1
+            request.updated_at = utcnow()
+            # Late replies are recorded for display/trace only. They NEVER change
+            # participant content, request status, or a final aggregation.
             self._audit(
                 request,
-                "late_reply_ingested",
+                "late_reply_received",
                 session.initiator_id,
                 agent_id=agent_id,
+                request_was_final=entry["request_was_final"],
             )
-            if (
-                request.status == RequestStatus.PARTIAL.value
-                and all(
-                    p.status == ParticipantStatus.COMPLETED.value
-                    for p in request.participants
-                )
-            ):
-                self._transition(request, RequestStatus.COMPLETED.value, session.initiator_id)
-                request.final_answer = self._aggregate(request, session)
-            self.store.save(request)
-            return request
 
-    def get_status(self, request_id: str, token: str) -> Dict[str, Any]:
-        with self._lock:
-            self.authz.resolve_session(token)
-            request = self.store.get_by_id(request_id)
-            if request is None:
-                raise NotFound(f"request {request_id} not found")
-            return request.to_dict()
+        self.store.update_atomic(request_id, mutate)
+        return self.store.get_by_id(request_id)
+
+    def get_status(
+        self, request_id: str, token: str, since_version: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        self.authz.resolve_session(token)
+        request = self.store.get_by_id(request_id)
+        if request is None:
+            raise NotFound(f"request {request_id} not found")
+        if since_version is not None and request.version <= since_version:
+            return None  # -> HTTP 304
+        return self._view(request)
+
+    def _view(self, request: MultiTriggerRequest) -> Dict[str, Any]:
+        data = request.to_dict()
+        data["initiator_user_id"] = request.initiator_id
+        data["run_ids"] = []
+        for attempt in request.attempts:
+            if attempt.run_id and attempt.run_id not in data["run_ids"]:
+                data["run_ids"].append(attempt.run_id)
+        for task in data["tasks"]:
+            task["remaining_attempts"] = max(
+                0, task["max_attempts"] - task["attempt_count"]
+            )
+        return data
+
+    def get_runs(
+        self, request_id: str, token: str, since_version: Optional[int] = None
+    ) -> Dict[str, Any]:
+        self.authz.resolve_session(token)
+        request = self.store.get_by_id(request_id)
+        if request is None:
+            raise NotFound(f"request {request_id} not found")
+        runs = []
+        for attempt in request.attempts:
+            if attempt.run_id:
+                runs.append(
+                    {
+                        "run_id": attempt.run_id,
+                        "agent_id": attempt.agent_id,
+                        "kind": "worker" if attempt.task_id else "participant",
+                        "task_id": attempt.task_id,
+                        "attempt": attempt.attempt_no,
+                        "status": attempt.status,
+                        "downstream_key": attempt.downstream_key,
+                    }
+                )
+        return {"request_id": request_id, "version": request.version, "runs": runs}
+
+    def get_trace(
+        self, request_id: str, token: str, since_seq: int = 0
+    ) -> Dict[str, Any]:
+        self.authz.resolve_session(token)
+        if self.store.get_by_id(request_id) is None:
+            raise NotFound(f"request {request_id} not found")
+        events = [e for e in self.store.get_audit(request_id) if e["seq"] > since_seq]
+        next_seq = events[-1]["seq"] if events else since_seq
+        return {"request_id": request_id, "events": events, "next_seq": next_seq}
 
     def get_audit(self, request_id: str, token: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            self.authz.resolve_session(token)
-            if self.store.get_by_id(request_id) is None:
-                raise NotFound(f"request {request_id} not found")
-            return self.store.get_audit(request_id)
+        return self.get_trace(request_id, token, 0)["events"]
 
     # ---- aggregation (untrusted agent text) ----------------------------------
     def _aggregate(
@@ -601,6 +860,8 @@ class MultiTriggerService:
         suppressed: List[Dict[str, Any]] = []
 
         if request.mode == Mode.SUPERVISOR.value:
+            # Supervisor mode uses only approved results; failed tasks are never
+            # held open waiting for approval.
             candidates = [
                 (t.worker_agent_id, t.run_id, t.result, t.attempt_count)
                 for t in request.tasks
@@ -626,7 +887,6 @@ class MultiTriggerService:
                 )
                 continue
             if contains_trigger_instruction(content):
-                # Treat agent output as untrusted: never act on embedded triggers.
                 suppressed.append({"agent_id": agent_id, "reason": "trigger_instruction_ignored"})
                 self._audit(
                     request,
@@ -658,6 +918,7 @@ class MultiTriggerService:
         return {
             "strategy": request.merge_strategy,
             "final_answer": text,
+            "content": text,
             "sources": sources,
             "suppressed": suppressed,
             "disagreement_preserved": disagreements,
